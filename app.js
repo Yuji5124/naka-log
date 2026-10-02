@@ -22,7 +22,7 @@
   /* =====================================================
    * 1. 定数・ユーティリティ
    * ===================================================== */
-  const APP_VERSION = '0.2.0';
+  const APP_VERSION = '0.2.1';
   const MAX_DIGITS = 8; // ¥99,999,999 まで
 
   // 人：payer（使った人）は self / wife、for（誰のため）は self / wife / family
@@ -34,15 +34,24 @@
   const PAYER_IDS = ['self', 'wife'];
   const FOR_IDS = ['self', 'wife', 'family'];
 
+  // 並び順 ＝ よく使いそうな順（上ほど押しやすい位置に出る）
   // defaultFor: 'family' = 家族のため / 'payer' = 使った人のため（あとでワンタップで変更可）
+  // id は記録に保存されるので変えないこと（名前・絵文字は設定で変えられる）
   const CATEGORY_DEFS = [
     { id: 'food', emoji: '🍚', name: '食費', tone: 'orange', defaultFor: 'family' },
+    { id: 'drink', emoji: '🥤', name: '飲み物', tone: 'teal', defaultFor: 'payer' },
     { id: 'daily', emoji: '🛒', name: '日用品', tone: 'yellow', defaultFor: 'family' },
     { id: 'transport', emoji: '🚃', name: '交通', tone: 'blue', defaultFor: 'payer' },
     { id: 'kids', emoji: '👶', name: '子ども', tone: 'pink', defaultFor: 'family' },
+    { id: 'expense', emoji: '💼', name: '経費', tone: 'indigo', defaultFor: 'payer' },
+    { id: 'meeting', emoji: '🤝', name: '打合わせ', tone: 'brown', defaultFor: 'payer' },
     { id: 'fun', emoji: '🎮', name: '娯楽', tone: 'purple', defaultFor: 'payer' },
-    { id: 'fixed', emoji: '🏠', name: '固定費', tone: 'green', defaultFor: 'family' },
     { id: 'clothes', emoji: '👕', name: '衣服', tone: 'sky', defaultFor: 'payer' },
+    { id: 'beauty', emoji: '💇', name: '美容', tone: 'coral', defaultFor: 'payer' },
+    { id: 'telecom', emoji: '📱', name: '通信費', tone: 'lime', defaultFor: 'family' },
+    { id: 'utilities', emoji: '💡', name: '光熱費', tone: 'yellow', defaultFor: 'family' },
+    { id: 'fixed', emoji: '🏠', name: '固定費', tone: 'green', defaultFor: 'family' },
+    { id: 'tax', emoji: '🧾', name: '税金', tone: 'indigo', defaultFor: 'family' },
     { id: 'other', emoji: '✨', name: 'その他', tone: 'gray', defaultFor: 'family' },
   ];
   const CATEGORY_IDS = CATEGORY_DEFS.map((c) => c.id);
@@ -160,7 +169,8 @@
     return {
       id: typeof raw.id === 'string' && raw.id ? raw.id.slice(0, 64) : uuid(),
       amount: amount,
-      category: CATEGORY_IDS.includes(raw.category) ? raw.category : 'other',
+      // 知らないカテゴリ（新しい版で増えたもの等）も消さずに残す。表示は「その他」扱い
+      category: typeof raw.category === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(raw.category) ? raw.category : 'other',
       payer: PAYER_IDS.includes(raw.payer) ? raw.payer : 'self',
       for: FOR_IDS.includes(raw.for) ? raw.for : 'family',
       datetime: datetime,
@@ -676,6 +686,8 @@
         const diff = cur ? Date.parse(t.updatedAt) - Date.parse(cur.updatedAt) : 1;
         if (diff > 0) toPut.push(t);
         else if (diff < 0) stale.push(cur);
+        // 同じ変更なのにこちらだけ「その他」＝古い版がカテゴリを読めずに書き換えたもの → クラウドの方に直す
+        else if (cur.category === 'other' && t.category !== 'other') toPut.push(t);
       });
       if (stale.length) await this.adapter.bulkPut(stale); // 自分の新しい方を「未送信」に戻す
       if (!toPut.length) return { applied: 0, stale: stale.length };
@@ -819,7 +831,9 @@
 
   /* ---------- 下部：カテゴリボタン＋タブ ---------- */
   function renderDock() {
-    $('#quickGrid').innerHTML = CATEGORY_DEFS.map((d) => {
+    const grid = $('#quickGrid');
+    const scrollTop = grid.scrollTop; // 描き直してもスクロール位置はそのまま
+    grid.innerHTML = CATEGORY_DEFS.map((d) => {
       const c = cat(d.id);
       return (
         '<button type="button" class="cat-btn tone-' + c.tone + '" data-action="open-entry" data-cat="' + c.id + '">' +
@@ -828,10 +842,18 @@
       );
     }).join('');
     $('#quickPanel').hidden = state.tab !== 'home';
+    grid.scrollTop = scrollTop;
+    updateQuickFade();
     document.querySelectorAll('.tab').forEach((b) => {
       if (b.dataset.tab === state.tab) b.setAttribute('aria-current', 'page');
       else b.removeAttribute('aria-current');
     });
+  }
+
+  /** カテゴリ欄の下に「まだ続きがある」ぼかしを出す（いちばん下まで見たら消す） */
+  function updateQuickFade() {
+    const g = $('#quickGrid');
+    g.classList.toggle('at-end', g.scrollTop + g.clientHeight >= g.scrollHeight - 4);
   }
 
   /* ---------- 共通：タイムライン ---------- */
@@ -1051,10 +1073,20 @@
     const isNow = month === todayKey().slice(0, 7);
     let rows = '';
 
+    let foot = '';
     if (state.sumMode === 'category') {
       const sums = {};
-      list.forEach((t) => { sums[t.category] = (sums[t.category] || 0) + t.amount; });
-      rows = CATEGORY_DEFS.map((d) => {
+      list.forEach((t) => {
+        const k = CATEGORY_IDS.includes(t.category) ? t.category : 'other';
+        sums[k] = (sums[k] || 0) + t.amount;
+      });
+      // 使ったカテゴリを金額の大きい順に。使っていないものは下に1行でまとめる
+      const used = CATEGORY_DEFS.filter((d) => sums[d.id]).sort((a, b) => sums[b.id] - sums[a.id]);
+      const unused = CATEGORY_DEFS.filter((d) => !sums[d.id]);
+      if (used.length && unused.length) {
+        foot = '<p class="sum-foot">記録なし：' + unused.map((d) => escapeHtml(cat(d.id).emoji + cat(d.id).name)).join('・') + '</p>';
+      }
+      rows = used.map((d) => {
         const c = cat(d.id);
         const v = sums[d.id] || 0;
         const w = total ? (v / total) * 100 : 0;
@@ -1065,7 +1097,7 @@
           '<div class="sum-row-bar"><span style="width:' + w.toFixed(1) + '%"></span></div></div>' +
           '<span class="sum-row-pct num">' + pctLabel(v, total) + '</span></div>'
         );
-      }).join('');
+      }).join('') || '<div class="empty">この月の記録はありません</div>';
     } else {
       rows = PAYER_IDS.map((id) => {
         const p = person(id);
@@ -1104,7 +1136,7 @@
       '<button type="button" class="seg-tab" data-action="sum-mode" data-mode="category" aria-pressed="' + (state.sumMode === 'category') + '">カテゴリ別</button>' +
       '<button type="button" class="seg-tab" data-action="sum-mode" data-mode="payer" aria-pressed="' + (state.sumMode === 'payer') + '">使った人別</button>' +
       '</div>' +
-      '<div class="card sum-list">' + rows + '</div>' +
+      '<div class="card sum-list">' + rows + '</div>' + foot +
       (state.sumMode === 'payer' ? '<p class="sum-foot">「使った人」＝お金を払った人。「〜のため」は誰のための支出かの内訳です。</p>' : '');
   }
 
@@ -1861,6 +1893,13 @@
       this.cfg = cfg;
       this.cursor = Number(await a.getSetting('sync.cursor')) || 0;
       this.settingsDirty = !!(await a.getSetting('sync.settingsDirty'));
+      if (!(await a.getSetting('sync.repairCategories'))) {
+        // v0.2.0 は知らないカテゴリを「その他」に書き換えて保存していたので、
+        // 一度だけクラウドから全部読み直して直す（夫婦2人分なら読み込みはすぐ終わる）
+        this.cursor = 0;
+        await a.setSetting('sync.cursor', 0);
+        await a.setSetting('sync.repairCategories', 1);
+      }
       a.trackChanges = true;
     },
 
@@ -2101,6 +2140,7 @@
       this.cursor = 0;
       this.settingsDirty = false;
       a.trackChanges = true;
+      await a.setSetting('sync.repairCategories', 1); // 最初から全部読むので直しは不要
       try {
         await this.start(parsed.mode);
         await a.setSetting('sync', this.cfg); // つながったときだけ保存する
@@ -2521,6 +2561,8 @@
       const mq = matchMedia('(prefers-color-scheme: dark)');
       if (mq.addEventListener) mq.addEventListener('change', applyTheme);
     }
+
+    $('#quickGrid').addEventListener('scroll', updateQuickFade, { passive: true });
 
     // 下部の高さを測って、内容が隠れないようにする
     const dock = $('#dock');
