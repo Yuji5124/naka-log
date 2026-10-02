@@ -1,0 +1,59 @@
+rules_version = '2';
+
+// なかログ「夫婦で同期」用の Firestore ルール
+//
+// 使い方：Firebase コンソール → Firestore Database → 「ルール」タブで、
+//         いま書かれている内容を全部消して、このファイルの中身を全部貼り付け →「公開」
+//
+// しくみ：
+//   - ふたりの記録は households/{共有ID}/transactions/{記録ID} に保存されます
+//   - 共有ID は推測できない長いランダムな文字列で、招待コードの中に入っています
+//   - 「どんな共有IDがあるか」の一覧は誰も取得できないので、共有IDを知らない人は読み書きできません
+//   - 記録の形がおかしいもの（金額が数字でない等）は保存できません
+//   - 記録の完全な削除はできません（削除は「削除済みの印」を付けるだけ。もう一方のスマホに伝えるため）
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function validHouseholdId(id) {
+      return id.size() >= 20 && id.size() <= 64;
+    }
+
+    function validHousehold(d) {
+      return d.keys().hasOnly(['app', 'createdAt', 'settings', 'settingsUpdatedAt', 'devices'])
+        && (!('settings' in d) || d.settings is map)
+        && (!('settingsUpdatedAt' in d) || d.settingsUpdatedAt is string)
+        && (!('devices' in d) || d.devices is map);
+    }
+
+    function validTx(d, txId) {
+      return d.keys().hasOnly(['id', 'amount', 'category', 'payer', 'for', 'datetime', 'memo', 'createdAt', 'updatedAt', 'deletedAt', 'serverUpdatedAt'])
+        && d.id == txId
+        && d.amount is int && d.amount >= 0 && d.amount <= 999999999
+        && d.category is string && d.category.size() <= 40
+        && d.payer is string && d.payer.size() <= 20
+        && d['for'] is string && d['for'].size() <= 20
+        && d.datetime is string && d.datetime.size() <= 40
+        && d.memo is string && d.memo.size() <= 200
+        && d.createdAt is string && d.updatedAt is string
+        && (d.deletedAt == null || d.deletedAt is string)
+        && d.serverUpdatedAt == request.time;
+    }
+
+    match /households/{householdId} {
+      allow get: if signedIn() && validHouseholdId(householdId);
+      allow create, update: if signedIn() && validHouseholdId(householdId) && validHousehold(request.resource.data);
+      allow list, delete: if false;
+
+      match /transactions/{txId} {
+        allow read: if signedIn() && validHouseholdId(householdId);
+        allow create, update: if signedIn() && validHouseholdId(householdId) && validTx(request.resource.data, txId);
+        allow delete: if false;
+      }
+    }
+  }
+}
