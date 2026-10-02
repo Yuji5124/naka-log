@@ -11,9 +11,10 @@
  *   7. バックアップ / 復元 / CSV
  *   8. 起動・PWA
  *
- * 将来の夫婦同期について
- *   FirebaseAdapter / SupabaseAdapter などを「2. StorageAdapter」と同じメソッドで作り、
- *   createAdapter() で返すものを差し替えるだけで、画面側のコードは変えずに済む設計です。
+ * 保存と同期の考え方
+ *   記録の本体はいつも端末内（StorageAdapter）。画面は Repository だけを使う。
+ *   同期（Sync）は Repository の外側で、未送信の変更（outbox）を送り、届いた変更を取り込む。
+ *   ネットや Firebase が使えなくても、記録はこれまでどおり端末内で続けられる。
  */
 (function () {
   'use strict';
@@ -21,7 +22,7 @@
   /* =====================================================
    * 1. 定数・ユーティリティ
    * ===================================================== */
-  const APP_VERSION = '0.1.0';
+  const APP_VERSION = '0.2.0';
   const MAX_DIGITS = 8; // ¥99,999,999 まで
 
   // 人：payer（使った人）は self / wife、for（誰のため）は self / wife / family
@@ -179,15 +180,19 @@
    *   saveTransaction(tx)            … 追加 / 上書き
    *   updateTransaction(id, patch)   … 一部更新して、更新後の記録を返す
    *   deleteTransaction(id)          … 論理削除（deletedAt を付ける。同期で削除を伝えるため）
-   *   bulkPut(list)                  … まとめて保存（復元用）
+   *   bulkPut(list, { track })       … まとめて保存（復元・クラウドからの受信）
    *   clearAll()                     … 全記録を消す
    *   getSetting(key) / setSetting(key, value)
-   *   subscribe(callback)            … 外部（別タブ・将来はクラウド）で変わったら呼ばれる
+   *   subscribe(callback)            … 別タブで変わったら呼ばれる
+   *
+   *   同期用（trackChanges = true の間、変更を outbox に記録する）
+   *   getOutbox() / ackOutbox(id, rev) / markAllDirty() / clearOutbox()
    * ===================================================== */
   const IDB_NAME = 'nakalog';
-  const IDB_VERSION = 1;
+  const IDB_VERSION = 2; // v2: 同期用の outbox（まだクラウドへ送っていない変更の一覧）を追加
   const LS_TX_KEY = 'nakalog.v1.transactions';
   const LS_SETTINGS_KEY = 'nakalog.v1.settings';
+  const LS_OUTBOX_KEY = 'nakalog.v1.outbox';
 
   class IndexedDBAdapter {
     constructor() {
@@ -196,6 +201,7 @@
       this.db = null;
       this.listeners = new Set();
       this.channel = null;
+      this.trackChanges = false; // true の間は、変更を outbox にも書く（同期中）
     }
 
     init() {
@@ -221,6 +227,9 @@
           if (!db.objectStoreNames.contains('settings')) {
             db.createObjectStore('settings', { keyPath: 'key' });
           }
+          if (!db.objectStoreNames.contains('outbox')) {
+            db.createObjectStore('outbox', { keyPath: 'id' });
+          }
         };
         req.onsuccess = () => {
           this.db = req.result;
@@ -232,23 +241,24 @@
           resolve();
         };
         req.onerror = () => reject(req.error || new Error('IndexedDBを開けませんでした'));
-        req.onblocked = () => reject(new Error('IndexedDBが他のタブで使用中です'));
+        // 古い版を別タブで開いていると、そのタブが閉じるまで待つ（ここで諦めると保存先が分かれてしまうため）
+        req.onblocked = () => console.warn('[なかログ] 他のタブが閉じるのを待っています');
       });
     }
 
     /** トランザクションを実行し、完了（=ディスクへ書き込み済み）してから結果を返す */
-    _run(storeName, mode, work) {
+    _run(stores, mode, work) {
       return new Promise((resolve, reject) => {
         let t;
         try {
-          t = this.db.transaction(storeName, mode);
+          t = this.db.transaction(stores, mode);
         } catch (e) {
           reject(e);
           return;
         }
         const box = { result: undefined };
         try {
-          work(t.objectStore(storeName), box);
+          work(t, box);
         } catch (e) {
           try { t.abort(); } catch (_) { /* noop */ }
           reject(e);
@@ -265,25 +275,32 @@
     }
 
     getTransactions() {
-      return this._run('transactions', 'readonly', (store, box) => {
-        const r = store.getAll();
+      return this._run(['transactions'], 'readonly', (t, box) => {
+        const r = t.objectStore('transactions').getAll();
         r.onsuccess = () => { box.result = r.result || []; };
       });
     }
 
     async saveTransaction(tx) {
-      await this._run('transactions', 'readwrite', (store) => store.put(tx));
+      const track = this.trackChanges;
+      await this._run(track ? ['transactions', 'outbox'] : ['transactions'], 'readwrite', (t) => {
+        t.objectStore('transactions').put(tx);
+        if (track) t.objectStore('outbox').put({ id: tx.id, rev: tx.updatedAt });
+      });
       this._changed();
       return tx;
     }
 
     async updateTransaction(id, patch) {
-      const updated = await this._run('transactions', 'readwrite', (store, box) => {
+      const track = this.trackChanges;
+      const updated = await this._run(track ? ['transactions', 'outbox'] : ['transactions'], 'readwrite', (t, box) => {
+        const store = t.objectStore('transactions');
         const g = store.get(id);
         g.onsuccess = () => {
           if (!g.result) return;
           box.result = Object.assign({}, g.result, patch);
           store.put(box.result);
+          if (track) t.objectStore('outbox').put({ id: id, rev: box.result.updatedAt });
         };
       });
       if (!updated) throw new Error('記録が見つかりません');
@@ -296,26 +313,74 @@
       return this.updateTransaction(id, { deletedAt: now, updatedAt: now });
     }
 
-    async bulkPut(list) {
-      await this._run('transactions', 'readwrite', (store) => list.forEach((tx) => store.put(tx)));
+    /** opts.track === false：クラウドから届いた変更なので outbox に入れない */
+    async bulkPut(list, opts) {
+      const track = this.trackChanges && !(opts && opts.track === false);
+      await this._run(track ? ['transactions', 'outbox'] : ['transactions'], 'readwrite', (t) => {
+        const store = t.objectStore('transactions');
+        const out = track ? t.objectStore('outbox') : null;
+        list.forEach((tx) => {
+          store.put(tx);
+          if (out) out.put({ id: tx.id, rev: tx.updatedAt });
+        });
+      });
       this._changed();
     }
 
     async clearAll() {
-      await this._run('transactions', 'readwrite', (store) => store.clear());
+      await this._run(['transactions', 'outbox'], 'readwrite', (t) => {
+        t.objectStore('transactions').clear();
+        t.objectStore('outbox').clear();
+      });
       this._changed();
     }
 
+    /* ---- outbox（未送信の変更） ---- */
+    getOutbox() {
+      return this._run(['outbox'], 'readonly', (t, box) => {
+        const r = t.objectStore('outbox').getAll();
+        r.onsuccess = () => { box.result = r.result || []; };
+      });
+    }
+
+    /** 送信済みにする。送信中にまた変更されていたら（rev が違えば）残して次回また送る */
+    ackOutbox(id, rev) {
+      return this._run(['outbox'], 'readwrite', (t) => {
+        const store = t.objectStore('outbox');
+        const g = store.get(id);
+        g.onsuccess = () => {
+          if (g.result && g.result.rev === rev) store.delete(id);
+        };
+      });
+    }
+
+    /** 同期を始めるとき：この端末の記録を全部「未送信」にする */
+    markAllDirty() {
+      return this._run(['transactions', 'outbox'], 'readwrite', (t) => {
+        const out = t.objectStore('outbox');
+        const r = t.objectStore('transactions').getAll();
+        r.onsuccess = () => {
+          (r.result || []).forEach((tx) => {
+            if (!tx.deletedAt) out.put({ id: tx.id, rev: tx.updatedAt });
+          });
+        };
+      });
+    }
+
+    clearOutbox() {
+      return this._run(['outbox'], 'readwrite', (t) => t.objectStore('outbox').clear());
+    }
+
     getSetting(key) {
-      return this._run('settings', 'readonly', (store, box) => {
-        const r = store.get(key);
+      return this._run(['settings'], 'readonly', (t, box) => {
+        const r = t.objectStore('settings').get(key);
         r.onsuccess = () => { box.result = r.result ? r.result.value : undefined; };
       });
     }
 
     async setSetting(key, value) {
-      await this._run('settings', 'readwrite', (store) => store.put({ key: key, value: value }));
-      this._changed();
+      await this._run(['settings'], 'readwrite', (t) => t.objectStore('settings').put({ key: key, value: value }));
+      if (key === 'shared') this._changed();
     }
 
     subscribe(cb) {
@@ -330,6 +395,7 @@
       this.kind = 'localstorage';
       this.label = 'この端末（localStorage）';
       this.listeners = new Set();
+      this.trackChanges = false;
     }
     async init() {
       const k = 'nakalog.v1.__test';
@@ -349,6 +415,22 @@
     _write(list) {
       localStorage.setItem(LS_TX_KEY, JSON.stringify(list)); // 容量不足なら例外 → 画面に保存失敗を表示
     }
+    _readOutbox() {
+      try {
+        return JSON.parse(localStorage.getItem(LS_OUTBOX_KEY) || '{}');
+      } catch (_) {
+        return {};
+      }
+    }
+    _writeOutbox(o) {
+      localStorage.setItem(LS_OUTBOX_KEY, JSON.stringify(o));
+    }
+    _track(list) {
+      if (!this.trackChanges) return;
+      const o = this._readOutbox();
+      list.forEach((t) => { o[t.id] = t.updatedAt; });
+      this._writeOutbox(o);
+    }
     async getTransactions() {
       return this._read();
     }
@@ -356,6 +438,7 @@
       const list = this._read().filter((t) => t.id !== tx.id);
       list.push(tx);
       this._write(list);
+      this._track([tx]);
       return tx;
     }
     async updateTransaction(id, patch) {
@@ -364,19 +447,41 @@
       if (i < 0) throw new Error('記録が見つかりません');
       list[i] = Object.assign({}, list[i], patch);
       this._write(list);
+      this._track([list[i]]);
       return list[i];
     }
     deleteTransaction(id) {
       const now = nowIso();
       return this.updateTransaction(id, { deletedAt: now, updatedAt: now });
     }
-    async bulkPut(items) {
+    async bulkPut(items, opts) {
       const map = new Map(this._read().map((t) => [t.id, t]));
       items.forEach((t) => map.set(t.id, t));
       this._write(Array.from(map.values()));
+      if (!(opts && opts.track === false)) this._track(items);
     }
     async clearAll() {
       this._write([]);
+      this._writeOutbox({});
+    }
+    async getOutbox() {
+      const o = this._readOutbox();
+      return Object.keys(o).map((id) => ({ id: id, rev: o[id] }));
+    }
+    async ackOutbox(id, rev) {
+      const o = this._readOutbox();
+      if (o[id] === rev) {
+        delete o[id];
+        this._writeOutbox(o);
+      }
+    }
+    async markAllDirty() {
+      const o = this._readOutbox();
+      this._read().forEach((t) => { if (!t.deletedAt) o[t.id] = t.updatedAt; });
+      this._writeOutbox(o);
+    }
+    async clearOutbox() {
+      this._writeOutbox({});
     }
     _settings() {
       try {
@@ -407,6 +512,7 @@
       this.label = '保存できません（一時的なメモリのみ）';
       this.list = [];
       this.settings = {};
+      this.outbox = {};
     }
     async init() {}
     _read() {
@@ -414,6 +520,12 @@
     }
     _write(list) {
       this.list = list.slice();
+    }
+    _readOutbox() {
+      return Object.assign({}, this.outbox);
+    }
+    _writeOutbox(o) {
+      this.outbox = Object.assign({}, o);
     }
     _settings() {
       return this.settings;
@@ -550,9 +662,41 @@
       return { added: toPut.length, skipped: skipped };
     }
 
+    /**
+     * クラウド（もう一方のスマホ）から届いた変更を取り込む。updatedAt が新しい方を残す。
+     * 届いたものより この端末の方が新しければ、送り直す（同時に送ったときの行き違いを直す）
+     */
+    async applyRemote(rawList) {
+      const toPut = [];
+      const stale = [];
+      rawList.forEach((raw) => {
+        const t = sanitizeTx(raw);
+        if (!t) return;
+        const cur = this.items.get(t.id);
+        const diff = cur ? Date.parse(t.updatedAt) - Date.parse(cur.updatedAt) : 1;
+        if (diff > 0) toPut.push(t);
+        else if (diff < 0) stale.push(cur);
+      });
+      if (stale.length) await this.adapter.bulkPut(stale); // 自分の新しい方を「未送信」に戻す
+      if (!toPut.length) return { applied: 0, stale: stale.length };
+      await this.adapter.bulkPut(toPut, { track: false });
+      toPut.forEach((t) => this.items.set(t.id, t));
+      this._reindex();
+      this._emit({ type: 'remote', count: toPut.length });
+      return { applied: toPut.length, stale: stale.length };
+    }
+
     async clearAll() {
-      await this.adapter.clearAll();
-      this.items = new Map();
+      if (this.adapter.trackChanges) {
+        // 同期中は「削除済みの印」を付けて送る → もう一方のスマホからも消える
+        const now = nowIso();
+        const list = this.list.map((t) => Object.assign({}, t, { deletedAt: now, updatedAt: now }));
+        if (list.length) await this.adapter.bulkPut(list);
+        list.forEach((t) => this.items.set(t.id, t));
+      } else {
+        await this.adapter.clearAll();
+        this.items = new Map();
+      }
       this._reindex();
       this._emit({ type: 'clear' });
     }
@@ -565,11 +709,12 @@
   /** 端末ごとの設定（この端末を使う人・テーマなど）→ localStorage */
   const Device = {
     key: 'nakalog.device',
-    data: { user: null, theme: 'auto', lastBackupAt: null, hideInstallTip: false, backupNudgeAfter: null },
+    data: { user: null, theme: 'auto', lastBackupAt: null, hideInstallTip: false, backupNudgeAfter: null, deviceId: null },
     load() {
       try {
         Object.assign(this.data, JSON.parse(localStorage.getItem(this.key) || '{}'));
       } catch (_) { /* 読めなくても動かす */ }
+      if (!this.data.deviceId) this.set('deviceId', uuid());
     },
     set(k, v) {
       this.data[k] = v;
@@ -581,19 +726,32 @@
 
   /** 夫婦で共有する設定（予算・呼び名・カテゴリ名）→ StorageAdapter（将来はクラウドで共有） */
   const Shared = {
-    data: { budget: 0, people: {}, categories: {} },
-    async load(adapter) {
-      const v = await adapter.getSetting('shared');
-      if (v && typeof v === 'object') {
-        this.data = {
-          budget: Math.max(0, Math.round(Number(v.budget) || 0)),
-          people: v.people && typeof v.people === 'object' ? v.people : {},
-          categories: v.categories && typeof v.categories === 'object' ? v.categories : {},
-        };
-      }
+    data: { budget: 0, people: {}, categories: {}, updatedAt: null },
+    sanitize(v) {
+      if (!v || typeof v !== 'object') return null;
+      return {
+        budget: Math.min(999999999, Math.max(0, Math.round(Number(v.budget) || 0))),
+        people: v.people && typeof v.people === 'object' ? v.people : {},
+        categories: v.categories && typeof v.categories === 'object' ? v.categories : {},
+        updatedAt: isoOrNull(v.updatedAt),
+      };
     },
-    save() {
-      return repo.adapter.setSetting('shared', this.data);
+    async load(adapter) {
+      const s = this.sanitize(await adapter.getSetting('shared'));
+      if (s) this.data = s;
+    },
+    async save() {
+      this.data.updatedAt = nowIso();
+      await repo.adapter.setSetting('shared', this.data);
+      Sync.onLocalSettings();
+    },
+    /** もう一方のスマホで変わった設定を取り込む（送り返さない） */
+    async applyRemote(v) {
+      const s = this.sanitize(v);
+      if (!s) return false;
+      this.data = s;
+      await repo.adapter.setSetting('shared', s);
+      return true;
     },
   };
 
@@ -779,7 +937,8 @@
     $('#view-home').innerHTML =
       bannersHtml() +
       '<header class="home-header">' + LOGO_SVG +
-      '<div><h1 class="brand-name">なかログ</h1><p class="brand-copy">ふたりのお金を、かんたん記録。</p></div></header>' +
+      '<div class="brand-text"><h1 class="brand-name">なかログ</h1><p class="brand-copy">ふたりのお金を、かんたん記録。</p></div>' +
+      '<button type="button" id="syncChip" class="sync-chip" data-action="go-sync" hidden></button></header>' +
       '<div class="date-nav">' +
       '<button type="button" class="icon-btn" data-action="day-prev" aria-label="前の日">' + ICON.left + '</button>' +
       '<div class="date-nav-label"><span>' + fmtYMD(day) + '</span>' + (isToday ? '<span class="today-badge">今日</span>' : '') + '</div>' +
@@ -799,6 +958,7 @@
         : '<div class="card empty"><span class="empty-big" aria-hidden="true">👇</span>' +
           (isToday ? 'まだ記録がありません。<br>下のボタンを押すと、すぐ記録できます' : 'この日の記録はありません。<br>下のボタンで、この日に記録できます') +
           '</div>');
+    Sync.refresh();
     afterListRender();
   }
 
@@ -950,6 +1110,15 @@
 
   /* ---------- 設定 ---------- */
   function renderSettings() {
+    const pending = $('#syncInput') ? $('#syncInput').value : '';
+    renderSettingsView();
+    if (pending && $('#syncInput')) {
+      $('#syncInput').value = pending;
+      onSyncInput();
+    }
+  }
+
+  function renderSettingsView() {
     const user = Device.data.user || 'self';
     const theme = Device.data.theme || 'auto';
     const last = Device.data.lastBackupAt;
@@ -981,16 +1150,18 @@
       '<div class="card set-card pad"><div class="seg">' + segUser + '</div>' +
       '<p class="set-note">この端末で記録すると「使った人」が自動でこの人になります（記録のときにワンタップで変更もできます）。</p></div></section>' +
 
+      '<section class="set-section" id="syncSection"><h2 class="set-title">夫婦で同期</h2>' + syncSectionHtml() + '</section>' +
+
       '<section class="set-section"><h2 class="set-title">データ管理</h2><div class="card set-card">' +
       '<dl class="storage-info">' +
-      '<dt>保存先</dt><dd>' + escapeHtml(repo.adapter.label) + '</dd>' +
+      '<dt>保存先</dt><dd>' + escapeHtml(repo.adapter.label) + (Sync.cfg ? '<br>＋ クラウドで夫婦と共有' : '') + '</dd>' +
       '<dt>記録</dt><dd>' + repo.list.length.toLocaleString('ja-JP') + '件（自動保存）</dd>' +
       '<dt>最終バックアップ</dt><dd>' + (last ? fmtYMD(dayKeyOf(new Date(last))) : 'まだありません') + '</dd>' +
       '</dl>' +
       '<button type="button" class="set-row" data-action="backup"><span class="set-row-icon" aria-hidden="true">💾</span><span class="set-row-text">JSONでバックアップ<small>すべての記録を1つのファイルに保存</small></span><span class="set-row-chev" aria-hidden="true">›</span></button>' +
       '<button type="button" class="set-row" data-action="restore"><span class="set-row-icon" aria-hidden="true">📥</span><span class="set-row-text">JSONから復元<small>今ある記録は消えません</small></span><span class="set-row-chev" aria-hidden="true">›</span></button>' +
       '<button type="button" class="set-row" data-action="csv"><span class="set-row-icon" aria-hidden="true">📄</span><span class="set-row-text">CSVで書き出す<small>Excel・Numbersで開けます</small></span><span class="set-row-chev" aria-hidden="true">›</span></button>' +
-      '</div><p class="set-note">記録はこの端末の中だけに保存されています。機種変更や故障に備えて、月に1回くらいバックアップしておくと安心です。</p></section>' +
+      '</div><p class="set-note">' + (Sync.cfg ? '同期していても、念のため月に1回くらいバックアップしておくと安心です。' : '記録はこの端末の中だけに保存されています。機種変更や故障に備えて、月に1回くらいバックアップしておくと安心です。') + '</p></section>' +
 
       '<section class="set-section"><h2 class="set-title">アプリ設定</h2><div class="card set-card">' +
       '<div class="set-sub"><div class="set-sub-label">月の予算（0 なら表示しません）</div>' +
@@ -1545,7 +1716,8 @@
 
   async function deleteAll() {
     const n = repo.list.length;
-    if (!confirm('すべての記録（' + n + '件）を削除します。\n元に戻せません。先に「JSONでバックアップ」することをおすすめします。\n\n本当に削除しますか？')) return;
+    const where = Sync.cfg ? '\n同期中なので、もう一方のスマホからも消えます。' : '';
+    if (!confirm('すべての記録（' + n + '件）を削除します。' + where + '\n元に戻せません。先に「JSONでバックアップ」することをおすすめします。\n\n本当に削除しますか？')) return;
     if (!confirm('最終確認：本当にすべて削除しますか？')) return;
     try {
       await repo.clearAll();
@@ -1569,7 +1741,560 @@
   }
 
   /* =====================================================
-   * 8. イベント・起動
+   * 8. 夫婦で同期（Firebase / Cloud Firestore）
+   *
+   *   - 記録はこれまでどおり端末内（IndexedDB）が本体。クラウドにはその写しを置いて共有する
+   *   - ネットがなくても記録でき、つながったときに未送信分（outbox）を送る
+   *   - 同じ記録が両方のスマホで変更されたら、updatedAt が新しい方を残す
+   *   - 受信は「前回受け取ったところ（cursor）以降」だけを読むので、記録が増えても通信量が増えにくい
+   *   - Firebase のプログラムは同期を使うときだけ読み込む（使わない人には影響なし）
+   * ===================================================== */
+  const FIREBASE_SDK = 'https://www.gstatic.com/firebasejs/12.19.0/';
+  const INVITE_PREFIX = 'nakalog-invite:';
+  const TX_FIELDS = ['id', 'amount', 'category', 'payer', 'for', 'datetime', 'memo', 'createdAt', 'updatedAt', 'deletedAt'];
+
+  function b64urlEncode(str) {
+    return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+  function b64urlDecode(s) {
+    s = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    return atob(s);
+  }
+  function randomId(bytes) {
+    const b = new Uint8Array(bytes);
+    crypto.getRandomValues(b);
+    return b64urlEncode(String.fromCharCode.apply(null, b));
+  }
+
+  /** Firebaseコンソールからコピーした設定（前後に余計な文字があってもOK）を読み取る */
+  function parseFirebaseConfig(text) {
+    const out = {};
+    const re = /(apiKey|authDomain|projectId|appId|emulatorHost)["']?\s*:\s*["']([^"'\s]+)["']/g;
+    let m;
+    while ((m = re.exec(String(text)))) out[m[1]] = m[2];
+    if (!out.apiKey || !out.projectId || !out.appId) return null;
+    if (!out.authDomain) out.authDomain = out.projectId + '.firebaseapp.com';
+    return out;
+  }
+  /** 招待コード ＝ Firebaseの接続先 ＋ 夫婦の共有ID */
+  function makeInvite(cfg) {
+    const f = cfg.firebase;
+    const o = { v: 1, k: f.apiKey, d: f.authDomain, p: f.projectId, a: f.appId, h: cfg.householdId };
+    if (f.emulatorHost) o.e = f.emulatorHost;
+    return INVITE_PREFIX + b64urlEncode(JSON.stringify(o));
+  }
+  function parseInvite(text) {
+    const m = String(text).replace(/\s+/g, '').match(/nakalog-invite:([A-Za-z0-9_-]+)/);
+    if (!m) return null;
+    try {
+      const o = JSON.parse(b64urlDecode(m[1]));
+      if (o.v !== 1 || !o.k || !o.p || !o.a || !o.h) return null;
+      const firebase = { apiKey: o.k, authDomain: o.d || o.p + '.firebaseapp.com', projectId: o.p, appId: o.a };
+      if (o.e) firebase.emulatorHost = o.e;
+      return { firebase: firebase, householdId: o.h };
+    } catch (_) {
+      return null;
+    }
+  }
+  /** 貼り付けられた内容が「招待コード」か「Firebaseの設定」かを見分ける */
+  function readSyncInput(text) {
+    const inv = parseInvite(text);
+    if (inv) return { mode: 'join', cfg: inv };
+    const fb = parseFirebaseConfig(text);
+    if (fb) return { mode: 'create', cfg: { firebase: fb, householdId: randomId(16) } };
+    return null;
+  }
+
+  function toRemote(t, m) {
+    const o = {};
+    TX_FIELDS.forEach((k) => { o[k] = t[k] === undefined ? null : t[k]; });
+    o.serverUpdatedAt = m.serverTimestamp();
+    return o;
+  }
+  function fromRemote(d) {
+    const o = {};
+    TX_FIELDS.forEach((k) => { o[k] = d[k]; });
+    return o;
+  }
+
+  function isNetworkError(err) {
+    const code = String((err && err.code) || '');
+    const msg = String((err && err.message) || err || '');
+    return /unavailable|deadline-exceeded|network-request-failed/.test(code) ||
+      /offline|network|Failed to fetch|dynamically imported module|Importing a module script failed|Load failed/i.test(msg);
+  }
+  function syncErrorMessage(err) {
+    const code = String((err && err.code) || '') + ' ' + String((err && err.message) || '');
+    if (/operation-not-allowed|admin-restricted/.test(code)) return 'Firebaseの「Authentication」で「匿名」ログインを有効にしてください。';
+    if (/api-key|invalid-api-key|API key/i.test(code)) return '貼り付けたFirebaseの設定が正しくないようです。もう一度コピーしてください。';
+    if (/permission-denied|insufficient permissions/i.test(code)) return 'Firestoreの「ルール」が設定されていないか、招待コードが違います。';
+    if (/nakalog\/not-found/.test(code)) return '共有が見つかりません。招待コードをもう一度コピーしてください。';
+    if (/not-found|NOT_FOUND/.test(code)) return 'Firestore Database がまだ作られていないようです。';
+    if (isNetworkError(err)) return 'ネットにつながっていません。つながってからもう一度お試しください。';
+    return '同期できませんでした（' + String((err && (err.code || err.message)) || err) + '）';
+  }
+
+  const Sync = {
+    cfg: null, // { firebase: {...}, householdId }
+    sdk: null,
+    fb: null, // { app, auth, db, m }
+    phase: 'off', // off | connecting | live | waiting（ネット待ち） | error
+    error: '',
+    serverConnected: null,
+    pendingCount: 0,
+    cursor: 0,
+    settingsDirty: false,
+    devices: {},
+    unsub: [],
+    pushing: false,
+    pushAgain: false,
+    pushTimer: null,
+    retryTimer: null,
+    cursorTimer: null,
+
+    /** 起動時：同期の設定があれば、変更の記録（outbox）を有効にする。接続は start() で */
+    async init() {
+      const a = repo.adapter;
+      const cfg = await a.getSetting('sync');
+      if (!cfg || !cfg.firebase || !cfg.householdId) return;
+      this.cfg = cfg;
+      this.cursor = Number(await a.getSetting('sync.cursor')) || 0;
+      this.settingsDirty = !!(await a.getSetting('sync.settingsDirty'));
+      a.trackChanges = true;
+    },
+
+    async loadSdk() {
+      if (!this.sdk) {
+        const mods = await Promise.all(['firebase-app.js', 'firebase-auth.js', 'firebase-firestore.js'].map((f) => import(FIREBASE_SDK + f)));
+        this.sdk = { app: mods[0], auth: mods[1], fs: mods[2] };
+      }
+      return this.sdk;
+    },
+
+    async connect() {
+      const sdk = await this.loadSdk();
+      if (!this.fb) {
+        const c = this.cfg.firebase;
+        const app = sdk.app.initializeApp({ apiKey: c.apiKey, authDomain: c.authDomain, projectId: c.projectId, appId: c.appId }, 'nakalog');
+        const auth = sdk.auth.initializeAuth(app, { persistence: [sdk.auth.indexedDBLocalPersistence, sdk.auth.browserLocalPersistence] });
+        const db = sdk.fs.initializeFirestore(app, {});
+        if (c.emulatorHost === '127.0.0.1' || c.emulatorHost === 'localhost') {
+          // 開発用：この端末のエミュレーターにだけつなげる（他のホストは無視）
+          sdk.auth.connectAuthEmulator(auth, 'http://' + c.emulatorHost + ':9099', { disableWarnings: true });
+          sdk.fs.connectFirestoreEmulator(db, c.emulatorHost, 8080);
+        }
+        this.fb = { app: app, auth: auth, db: db, m: sdk.fs };
+      }
+      await this.fb.auth.authStateReady();
+      if (!this.fb.auth.currentUser) await sdk.auth.signInAnonymously(this.fb.auth);
+      return this.fb;
+    },
+
+    hRef() {
+      return this.fb.m.doc(this.fb.db, 'households', this.cfg.householdId);
+    },
+    col() {
+      return this.fb.m.collection(this.fb.db, 'households', this.cfg.householdId, 'transactions');
+    },
+
+    /** mode: 'create'（新しく始める） / 'join'（招待コードで参加） / 省略（いつもの起動） */
+    async start(mode) {
+      if (!this.cfg) return;
+      this.stopListening();
+      clearTimeout(this.retryTimer);
+      this.phase = 'connecting';
+      this.error = '';
+      this.refresh();
+      try {
+        await this.connect();
+        const m = this.fb.m;
+        if (mode === 'create') {
+          if (!Shared.data.updatedAt) Shared.data.updatedAt = nowIso();
+          await m.setDoc(this.hRef(), { app: 'nakalog', createdAt: m.serverTimestamp(), settings: Shared.data, settingsUpdatedAt: Shared.data.updatedAt });
+        } else if (mode === 'join') {
+          const snap = await m.getDoc(this.hRef());
+          if (!snap.exists()) throw Object.assign(new Error('共有が見つかりません'), { code: 'nakalog/not-found' });
+          const d = snap.data();
+          if (d.settings) await Shared.applyRemote(Object.assign({}, d.settings, { updatedAt: d.settingsUpdatedAt || nowIso() }));
+        }
+        if (mode) await repo.adapter.markAllDirty(); // この端末にあった記録も共有する
+        this.listen();
+        this.phase = 'live';
+        this.updatePresence();
+        this.schedulePush(0);
+      } catch (err) {
+        this.handleError(err);
+        if (mode) throw err;
+      } finally {
+        this.refresh();
+      }
+    },
+
+    listen() {
+      const m = this.fb.m;
+      this.serverConnected = null;
+      const q = m.query(this.col(), m.where('serverUpdatedAt', '>=', m.Timestamp.fromMillis(this.cursor)), m.orderBy('serverUpdatedAt'));
+      this.unsub.push(m.onSnapshot(q, { includeMetadataChanges: true }, (snap) => this.onTxSnap(snap), (err) => this.onListenError(err)));
+      this.unsub.push(m.onSnapshot(this.hRef(), (snap) => this.onHouseSnap(snap), (err) => this.onListenError(err)));
+    },
+    stopListening() {
+      this.unsub.forEach((u) => { try { u(); } catch (_) { /* noop */ } });
+      this.unsub = [];
+    },
+    onListenError(err) {
+      this.stopListening();
+      this.phase = 'waiting';
+      this.handleError(err);
+      if (this.phase !== 'error') this.retryLater();
+      this.refresh();
+    },
+
+    onTxSnap(snap) {
+      this.serverConnected = !snap.metadata.fromCache;
+      const list = [];
+      let max = this.cursor;
+      snap.docChanges().forEach((ch) => {
+        if (ch.type === 'removed') return;
+        const d = ch.doc.data();
+        if (!d.serverUpdatedAt || typeof d.serverUpdatedAt.toMillis !== 'function') return; // 自分の送信中のもの
+        max = Math.max(max, d.serverUpdatedAt.toMillis());
+        list.push(fromRemote(d));
+      });
+      const done = (res) => {
+        this.setCursor(max);
+        if (res && res.stale) this.schedulePush(0);
+      };
+      if (list.length) repo.applyRemote(list).then(done).catch(showSaveError);
+      else done();
+      this.refresh();
+    },
+
+    onHouseSnap(snap) {
+      if (!snap.exists()) return;
+      const d = snap.data();
+      this.devices = d.devices || {};
+      const remoteAt = Date.parse(d.settingsUpdatedAt || '') || 0;
+      const localAt = Date.parse(Shared.data.updatedAt || '') || 0;
+      if (d.settings && remoteAt > localAt && !this.settingsDirty) {
+        Shared.applyRemote(Object.assign({}, d.settings, { updatedAt: d.settingsUpdatedAt }))
+          .then((ok) => { if (ok) render(); })
+          .catch(() => {});
+      }
+      this.refresh();
+    },
+
+    setCursor(ms) {
+      if (ms <= this.cursor) return;
+      this.cursor = ms;
+      clearTimeout(this.cursorTimer);
+      this.cursorTimer = setTimeout(() => repo.adapter.setSetting('sync.cursor', this.cursor).catch(() => {}), 800);
+    },
+
+    updatePresence() {
+      if (!this.fb || this.phase !== 'live') return;
+      const m = this.fb.m;
+      const me = {};
+      me[Device.data.deviceId] = { user: Device.data.user || 'self', lastSeen: m.serverTimestamp() };
+      m.setDoc(this.hRef(), { devices: me }, { merge: true }).catch(() => {});
+    },
+
+    onLocalSettings() {
+      if (!this.cfg) return;
+      this.settingsDirty = true;
+      repo.adapter.setSetting('sync.settingsDirty', true).catch(() => {});
+      this.schedulePush(0);
+    },
+
+    schedulePush(delay) {
+      if (!this.cfg) return;
+      clearTimeout(this.pushTimer);
+      this.pushTimer = setTimeout(() => this.push(), delay == null ? 400 : delay);
+      this.countPending();
+    },
+    async countPending() {
+      try {
+        this.pendingCount = (await repo.adapter.getOutbox()).length;
+      } catch (_) { /* noop */ }
+      this.refresh();
+    },
+    retryLater() {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = setTimeout(() => {
+        if (this.phase === 'live') this.schedulePush(0);
+        else if (this.phase === 'waiting') this.start().catch(() => {});
+      }, 20000);
+    },
+
+    /** 未送信の変更を送る。クラウドの方が新しい記録は上書きしない */
+    async push() {
+      if (!this.cfg || this.phase !== 'live' || !navigator.onLine) {
+        this.countPending();
+        return;
+      }
+      if (this.pushing) {
+        this.pushAgain = true;
+        return;
+      }
+      this.pushing = true;
+      this.refresh();
+      try {
+        const m = this.fb.m;
+        const outbox = await repo.adapter.getOutbox();
+        this.pendingCount = outbox.length;
+        for (let i = 0; i < outbox.length; i += 30) {
+          const chunk = outbox.slice(i, i + 30);
+          const remote = await m.getDocsFromServer(m.query(this.col(), m.where(m.documentId(), 'in', chunk.map((e) => e.id))));
+          const remoteAt = new Map();
+          remote.forEach((s) => remoteAt.set(s.id, Date.parse(s.get('updatedAt')) || 0));
+          const batch = m.writeBatch(this.fb.db);
+          let writes = 0;
+          chunk.forEach((e) => {
+            const t = this.localTx(e.id);
+            if (!t) return;
+            if (remoteAt.has(t.id) && remoteAt.get(t.id) > Date.parse(t.updatedAt)) return; // クラウドの方が新しい
+            batch.set(m.doc(this.col(), t.id), toRemote(t, m));
+            writes++;
+          });
+          if (writes) await batch.commit();
+          for (const e of chunk) await repo.adapter.ackOutbox(e.id, e.rev);
+          this.pendingCount = Math.max(0, this.pendingCount - chunk.length);
+          this.refresh();
+        }
+        if (this.settingsDirty) {
+          await m.updateDoc(this.hRef(), { settings: Shared.data, settingsUpdatedAt: Shared.data.updatedAt || nowIso() });
+          this.settingsDirty = false;
+          await repo.adapter.setSetting('sync.settingsDirty', false);
+        }
+      } catch (err) {
+        this.handleError(err);
+        if (this.phase !== 'error') this.retryLater();
+      } finally {
+        this.pushing = false;
+        if (this.pushAgain) {
+          this.pushAgain = false;
+          this.schedulePush(0);
+        } else {
+          this.countPending();
+        }
+      }
+    },
+
+    localTx(id) {
+      return repo.items.get(id) || null; // 削除済みの印が付いたものも送る
+    },
+
+    handleError(err) {
+      console.warn('[なかログ] 同期:', err);
+      if (isNetworkError(err)) {
+        if (this.phase !== 'live') this.phase = 'waiting';
+        return;
+      }
+      this.phase = 'error';
+      this.error = syncErrorMessage(err);
+    },
+
+    /** 設定画面から：Firebaseの設定（はじめる） or 招待コード（参加する） */
+    async begin(parsed) {
+      const a = repo.adapter;
+      this.cfg = parsed.cfg;
+      this.cursor = 0;
+      this.settingsDirty = false;
+      a.trackChanges = true;
+      try {
+        await this.start(parsed.mode);
+        await a.setSetting('sync', this.cfg); // つながったときだけ保存する
+      } catch (err) {
+        const msg = syncErrorMessage(err);
+        await this.leave();
+        throw new Error(msg);
+      }
+    },
+
+    async leave() {
+      this.stopListening();
+      clearTimeout(this.pushTimer);
+      clearTimeout(this.retryTimer);
+      clearTimeout(this.cursorTimer);
+      if (this.fb && this.sdk) {
+        try { await this.sdk.app.deleteApp(this.fb.app); } catch (_) { /* noop */ }
+      }
+      this.fb = null;
+      this.cfg = null;
+      this.phase = 'off';
+      this.error = '';
+      this.cursor = 0;
+      this.settingsDirty = false;
+      this.devices = {};
+      this.pendingCount = 0;
+      const a = repo.adapter;
+      a.trackChanges = false;
+      await a.setSetting('sync', null);
+      await a.setSetting('sync.cursor', 0);
+      await a.setSetting('sync.settingsDirty', false);
+      await a.clearOutbox();
+      this.refresh();
+    },
+
+    status() {
+      if (!this.cfg) return { key: 'off', label: '' };
+      if (this.phase === 'error') return { key: 'error', label: '⚠️ 同期エラー' };
+      if (this.phase === 'connecting' || (this.phase === 'live' && this.serverConnected === null && navigator.onLine)) {
+        return { key: 'busy', label: '☁️ つないでいます' };
+      }
+      const offline = !navigator.onLine || this.phase === 'waiting' || !this.serverConnected;
+      if (offline) {
+        return this.pendingCount
+          ? { key: 'pending', label: '⏳ 未送信 ' + this.pendingCount + '件' }
+          : { key: 'offline', label: '📴 オフライン' };
+      }
+      if (this.pendingCount || this.pushing) return { key: 'busy', label: '🔄 同期中' };
+      return { key: 'ok', label: '☁️ 同期済み' };
+    },
+
+    /** 画面の同期表示だけを書き換える（全体を描き直さない） */
+    refresh() {
+      const s = this.status();
+      const chip = document.getElementById('syncChip');
+      if (chip) {
+        chip.hidden = s.key === 'off';
+        chip.textContent = s.label;
+        chip.className = 'sync-chip sync-' + s.key;
+      }
+      const box = document.getElementById('syncStatus');
+      if (box) box.innerHTML = syncStatusHtml();
+    },
+  };
+
+  function syncStatusHtml() {
+    const s = Sync.status();
+    const users = [];
+    Object.keys(Sync.devices || {}).forEach((k) => {
+      const u = Sync.devices[k] && Sync.devices[k].user;
+      if (PAYER_IDS.includes(u) && !users.includes(u)) users.push(u);
+    });
+    users.sort((a, b) => PAYER_IDS.indexOf(a) - PAYER_IDS.indexOf(b));
+    let note = '';
+    if (s.key === 'error') note = Sync.error;
+    else if (s.key === 'pending' || s.key === 'offline') note = 'ネットにつながったら自動で送ります。記録はこのまま続けられます。';
+    return (
+      '<div class="sync-state sync-' + s.key + '">' + escapeHtml(s.label) + '</div>' +
+      (note ? '<p class="set-note">' + escapeHtml(note) + '</p>' : '') +
+      (s.key === 'error' ? '<button type="button" class="btn btn-outline mt-8" data-action="sync-retry">もう一度つなぐ</button>' : '') +
+      '<p class="set-note">つながっている人：' +
+      (users.length ? users.map((u) => person(u).emoji + ' ' + escapeHtml(person(u).name)).join('・') : 'まだ確認中です') +
+      (users.length === 1 ? '<br>もう一方のスマホで、下の招待コードを貼り付けてください。' : '') +
+      '</p>'
+    );
+  }
+
+  function syncSectionHtml() {
+    if (!Sync.cfg) {
+      return (
+        '<div class="card set-card pad">' +
+        '<p class="set-text">ふたりのスマホで、同じ記録が見られるようになります。</p>' +
+        '<ol class="install-steps">' +
+        '<li>はじめる人：Firebaseの設定を貼り付けて「はじめる」<br><small>（準備のしかたは README の「夫婦で同期する」）</small></li>' +
+        '<li>もう一人：届いた<b>招待コード</b>を貼り付けて「参加する」</li>' +
+        '</ol>' +
+        '<textarea id="syncInput" class="text-input sync-input" rows="4" placeholder="ここに「Firebaseの設定」か「招待コード」を貼り付け" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>' +
+        '<p id="syncDetect" class="set-note" aria-live="polite"></p>' +
+        '<button type="button" id="syncGo" class="btn btn-primary mt-8" data-action="sync-go" disabled>つなぐ</button>' +
+        '<p class="set-note">この端末の記録も、ふたりの記録に加わります。</p>' +
+        '</div>'
+      );
+    }
+    const invite = makeInvite(Sync.cfg);
+    return (
+      '<div class="card set-card pad">' +
+      '<div id="syncStatus">' + syncStatusHtml() + '</div>' +
+      '<div class="set-sub-label mt-16">招待コード（もう一方のスマホに貼り付け）</div>' +
+      '<div class="invite-code" id="inviteCode">' + escapeHtml(invite) + '</div>' +
+      '<div class="invite-actions">' +
+      '<button type="button" class="btn btn-soft" data-action="invite-copy">コピー</button>' +
+      '<button type="button" class="btn btn-soft" data-action="invite-share">LINEなどで送る</button>' +
+      '</div>' +
+      '<p class="set-note">⚠️ 招待コードを知っている人は、ふたりの記録を見られます。夫婦以外には送らないでください。</p>' +
+      '<button type="button" class="set-row danger" data-action="sync-leave"><span class="set-row-icon" aria-hidden="true">⛔</span><span class="set-row-text">この端末の同期をやめる<small>この端末の記録はそのまま残ります</small></span></button>' +
+      '</div>'
+    );
+  }
+
+  function onSyncInput() {
+    const input = $('#syncInput');
+    const btn = $('#syncGo');
+    if (!input || !btn) return;
+    const r = input.value.trim() ? readSyncInput(input.value) : null;
+    const detect = $('#syncDetect');
+    if (!input.value.trim()) {
+      detect.textContent = '';
+      btn.textContent = 'つなぐ';
+    } else if (!r) {
+      detect.textContent = '読み取れませんでした。コピーした内容を、そのまま全部貼り付けてください。';
+      btn.textContent = 'つなぐ';
+    } else if (r.mode === 'join') {
+      detect.textContent = '✓ 招待コードを読み取りました';
+      btn.textContent = '参加する';
+    } else {
+      detect.textContent = '✓ Firebaseの設定を読み取りました（プロジェクト：' + r.cfg.firebase.projectId + '）';
+      btn.textContent = 'はじめる';
+    }
+    btn.disabled = !r;
+  }
+
+  async function syncGo() {
+    const input = $('#syncInput');
+    const parsed = input ? readSyncInput(input.value) : null;
+    if (!parsed) return;
+    const btn = $('#syncGo');
+    btn.disabled = true;
+    btn.textContent = 'つないでいます…';
+    try {
+      await Sync.begin(parsed);
+      renderSettings();
+      toast(parsed.mode === 'join' ? '参加しました。ふたりの記録が届きます' : '同期を始めました。招待コードを送ってください');
+    } catch (err) {
+      btn.disabled = false;
+      onSyncInput();
+      $('#syncDetect').textContent = '⚠️ ' + err.message;
+    }
+  }
+
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch (_) { /* noop */ }
+      ta.remove();
+      return ok;
+    }
+  }
+
+  async function shareInvite() {
+    const invite = makeInvite(Sync.cfg);
+    const text = 'なかログの招待コードです。\nなかログの「設定 → 夫婦で同期」に、このメッセージをそのまま貼り付けてください。\n\n' + invite;
+    if (navigator.share) {
+      try {
+        await navigator.share({ text: text });
+        return;
+      } catch (err) {
+        if (err && err.name === 'AbortError') return;
+      }
+    }
+    if (await copyText(text)) toast('コピーしました。LINEなどに貼り付けて送ってください');
+  }
+
+  /* =====================================================
+   * 9. イベント・起動
    * ===================================================== */
   function showOnboarding() {
     $('#obChoices').innerHTML = PAYER_IDS.map((id) => {
@@ -1643,6 +2368,7 @@
 
     'set-user': (el) => {
       Device.set('user', el.dataset.v);
+      Sync.updatePresence();
       renderSettings();
       toast('この端末を「' + person(el.dataset.v).name + '」にしました');
     },
@@ -1681,6 +2407,24 @@
       if (fn) Promise.resolve(fn()).catch(showSaveError);
     },
     'close-save-error': () => { $('#saveError').hidden = true; },
+
+    'go-sync': () => {
+      switchTab('settings');
+      const sec = $('#syncSection');
+      if (sec) sec.scrollIntoView({ block: 'start' });
+    },
+    'sync-go': () => syncGo(),
+    'sync-retry': () => { Sync.start().catch(() => {}); },
+    'sync-leave': async () => {
+      if (!confirm('この端末の同期をやめますか？\nこの端末の記録はそのまま残ります。もう一方のスマホの記録も消えません。\nあとで招待コードを貼り付ければ、また同期できます。')) return;
+      await Sync.leave();
+      renderSettings();
+      toast('同期をやめました');
+    },
+    'invite-copy': async () => {
+      if (await copyText(makeInvite(Sync.cfg))) toast('招待コードをコピーしました');
+    },
+    'invite-share': () => shareInvite(),
   };
 
   let longPressTimer = null;
@@ -1727,6 +2471,16 @@
     document.addEventListener('change', (e) => {
       if (e.target.matches && e.target.matches('[data-setting]')) onSettingChange(e.target);
     });
+    document.addEventListener('input', (e) => {
+      if (e.target && e.target.id === 'syncInput') onSyncInput();
+    });
+    window.addEventListener('online', () => {
+      if (!Sync.cfg) return;
+      if (Sync.phase === 'live') Sync.schedulePush(0);
+      else if (Sync.phase === 'waiting') Sync.start().catch(() => {});
+      Sync.refresh();
+    });
+    window.addEventListener('offline', () => Sync.refresh());
     $('#restoreInput').addEventListener('change', (e) => handleRestoreFile(e.target.files && e.target.files[0]));
 
     // PCのキーボードでも入力できる
@@ -1754,7 +2508,14 @@
     // iOSで:activeの見た目を効かせる
     document.addEventListener('touchstart', () => {}, { passive: true });
 
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) tickToday(); });
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) return;
+      tickToday();
+      if (Sync.phase === 'live') {
+        Sync.schedulePush(0);
+        Sync.updatePresence();
+      }
+    });
     setInterval(tickToday, 30000);
     if (window.matchMedia) {
       const mq = matchMedia('(prefers-color-scheme: dark)');
@@ -1807,6 +2568,7 @@
 
     const adapter = await createAdapter();
     repo = new Repository(adapter);
+    try { await Sync.init(); } catch (err) { console.warn('[なかログ] 同期設定の読み込み失敗', err); }
     try { await migrateFromLocalStorage(adapter); } catch (err) { console.warn('[なかログ] 引っ越し失敗', err); }
     try { await Shared.load(adapter); } catch (err) { console.warn('[なかログ] 設定の読み込み失敗', err); }
     try {
@@ -1815,6 +2577,7 @@
       showSaveError(err);
     }
     repo.onChange(onDataChange);
+    repo.onChange((info) => { if (info.type !== 'remote') Sync.schedulePush(); });
     // 別のタブ（将来はもう一方のスマホ）で変更があったら読み直す
     adapter.subscribe(async () => {
       try {
@@ -1830,9 +2593,10 @@
     render();
     if (!Device.data.user) showOnboarding();
     if (env.standalone) requestPersist();
+    if (Sync.cfg) Sync.start().catch(() => {}); // 画面を出してから、裏でつなぐ
 
     // 動作確認用（開発者ツールから window.nakalog で中身を見られる）
-    window.nakalog = { version: APP_VERSION, repo: repo, state: state };
+    window.nakalog = { version: APP_VERSION, repo: repo, state: state, sync: Sync };
   }
 
   boot();

@@ -219,6 +219,7 @@ h1, h2, h3, p { margin: 0; }
 }
 .center { text-align: center; }
 .mt-16 { margin-top: 16px; }
+.mt-8 { margin-top: 8px; }
 
 /* 人ごとの色 */
 .who-self   { --who: var(--self);   --who-soft: var(--self-soft);   --who-ink: var(--self-ink); }
@@ -267,7 +268,24 @@ h1, h2, h3, p { margin: 0; }
   padding: 0 2px 4px;
 }
 .logo { width: 40px; height: 40px; flex: none; border-radius: 12px; }
+.brand-text { flex: 1; min-width: 0; }
 .brand-name { font-size: 22px; font-weight: 800; letter-spacing: 0.04em; line-height: 1.2; }
+
+/* 同期の状態（ホーム右上） */
+.sync-chip {
+  flex: none;
+  min-height: 36px;
+  padding: 0 12px;
+  border-radius: 999px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-size: 13px; font-weight: 700;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.sync-chip.sync-ok { color: var(--family-ink); }
+.sync-chip.sync-pending { background: #FFF3C7; color: #6E5200; }
+.sync-chip.sync-error { background: var(--danger-soft); color: var(--danger); }
 .brand-copy { font-size: 13px; color: var(--text-3); }
 
 .date-nav {
@@ -791,6 +809,38 @@ details.set-details > summary {
 details.set-details > summary::-webkit-details-marker { display: none; }
 details.set-details[open] > summary .set-row-chev { transform: rotate(90deg); }
 .install-steps { margin: 0; padding-left: 1.4em; font-size: 15px; line-height: 1.8; }
+.install-steps small { color: var(--text-3); }
+
+/* 夫婦で同期 */
+.set-text { font-size: 15px; margin-bottom: 8px; }
+.sync-input {
+  margin-top: 12px;
+  min-height: 104px;
+  padding: 12px 14px;
+  font-size: 16px;
+  line-height: 1.5;
+  resize: vertical;
+  word-break: break-all;
+}
+.sync-state { font-size: 18px; font-weight: 800; }
+.sync-state.sync-ok { color: var(--family-ink); }
+.sync-state.sync-error { color: var(--danger); }
+.invite-code {
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-all;
+  -webkit-user-select: all;
+  user-select: all;
+  max-height: 120px;
+  overflow-y: auto;
+}
+.invite-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0 4px; }
+.invite-actions .btn { min-height: 48px; font-size: 15px; }
+#syncSection .set-row { margin-top: 8px; border-top: 1px solid var(--line); }
 .about { display: flex; align-items: center; gap: 12px; }
 .about b { font-size: 17px; }
 .about small { display: block; color: var(--text-3); font-size: 13px; }
