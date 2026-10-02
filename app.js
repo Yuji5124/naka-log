@@ -686,6 +686,8 @@
         const diff = cur ? Date.parse(t.updatedAt) - Date.parse(cur.updatedAt) : 1;
         if (diff > 0) toPut.push(t);
         else if (diff < 0) stale.push(cur);
+        // 同じ変更なのにこちらだけ「その他」＝古い版がカテゴリを読めずに書き換えたもの → クラウドの方に直す
+        else if (cur.category === 'other' && t.category !== 'other') toPut.push(t);
       });
       if (stale.length) await this.adapter.bulkPut(stale); // 自分の新しい方を「未送信」に戻す
       if (!toPut.length) return { applied: 0, stale: stale.length };
@@ -1891,6 +1893,13 @@
       this.cfg = cfg;
       this.cursor = Number(await a.getSetting('sync.cursor')) || 0;
       this.settingsDirty = !!(await a.getSetting('sync.settingsDirty'));
+      if (!(await a.getSetting('sync.repairCategories'))) {
+        // v0.2.0 は知らないカテゴリを「その他」に書き換えて保存していたので、
+        // 一度だけクラウドから全部読み直して直す（夫婦2人分なら読み込みはすぐ終わる）
+        this.cursor = 0;
+        await a.setSetting('sync.cursor', 0);
+        await a.setSetting('sync.repairCategories', 1);
+      }
       a.trackChanges = true;
     },
 
@@ -2131,6 +2140,7 @@
       this.cursor = 0;
       this.settingsDirty = false;
       a.trackChanges = true;
+      await a.setSetting('sync.repairCategories', 1); // 最初から全部読むので直しは不要
       try {
         await this.start(parsed.mode);
         await a.setSetting('sync', this.cfg); // つながったときだけ保存する
