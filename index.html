@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>なかログ</title>
+  <meta name="description" content="ふたりのお金を、かんたん記録。夫婦2人のお金の生活ログ。">
+  <meta name="theme-color" content="#F5F6F8">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="なかログ">
+  <meta name="format-detection" content="telephone=no">
+  <!-- パスはすべて相対パス（GitHub Pages の /リポジトリ名/ 配下でも動くように） -->
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" href="icon-192.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="stylesheet" href="style.css?v=0.1.0">
+</head>
+<body>
+  <!-- 保存エラー（保存に失敗したときだけ表示） -->
+  <div id="saveError" class="save-error" role="alert" hidden>
+    <span class="save-error-msg"></span>
+    <button type="button" class="save-error-close" data-action="close-save-error" aria-label="閉じる">×</button>
+  </div>
+
+  <div id="app" class="app">
+    <main>
+      <section id="view-home" class="view" aria-label="今日"></section>
+      <section id="view-calendar" class="view" aria-label="カレンダー" hidden></section>
+      <section id="view-summary" class="view" aria-label="集計" hidden></section>
+      <section id="view-settings" class="view" aria-label="設定" hidden></section>
+    </main>
+  </div>
+
+  <!-- 画面下に固定：カテゴリボタン ＋ タブ -->
+  <div id="dock" class="dock">
+    <div id="quickPanel" class="quick-panel">
+      <div id="quickGrid" class="quick-grid"></div>
+    </div>
+    <nav class="tabbar" aria-label="メニュー">
+      <button type="button" class="tab" data-action="tab" data-tab="home">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 10.5 12 3.5l8.5 7V20a1 1 0 0 1-1 1H15v-6H9v6H4.5a1 1 0 0 1-1-1z"/></svg>
+        <span>今日</span>
+      </button>
+      <button type="button" class="tab" data-action="tab" data-tab="calendar">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="3"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>
+        <span>カレンダー</span>
+      </button>
+      <button type="button" class="tab" data-action="tab" data-tab="summary">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 20v-8M12 20V5M18 20v-5"/></svg>
+        <span>集計</span>
+      </button>
+      <button type="button" class="tab" data-action="tab" data-tab="settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h9M18 7h2M4 17h2M11 17h9"/><circle cx="15.5" cy="7" r="2.5"/><circle cx="8.5" cy="17" r="2.5"/></svg>
+        <span>設定</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- 金額入力シート -->
+  <div id="entrySheet" class="sheet" role="dialog" aria-modal="true" aria-labelledby="entryCat" hidden>
+    <div class="sheet-backdrop" data-action="close-entry"></div>
+    <div class="sheet-panel entry-panel" tabindex="-1">
+      <div class="sheet-top">
+        <button type="button" class="icon-btn" data-action="close-entry" aria-label="閉じる">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+        </button>
+        <div id="entryDay" class="entry-day"></div>
+        <span class="icon-btn-spacer"></span>
+      </div>
+      <div id="entryCat" class="entry-cat"></div>
+      <div class="entry-amount" aria-live="polite">
+        <span class="yen-mark">¥</span><span id="entryAmountNum" class="entry-amount-num">0</span><span class="caret" aria-hidden="true"></span>
+      </div>
+      <div id="entryHint" class="entry-hint" aria-live="assertive"></div>
+      <div id="entryFreq" class="freq-row"></div>
+      <div class="quick-add">
+        <button type="button" class="quick-add-btn" data-action="quick-add" data-add="100">+100</button>
+        <button type="button" class="quick-add-btn" data-action="quick-add" data-add="500">+500</button>
+        <button type="button" class="quick-add-btn" data-action="quick-add" data-add="1000">+1,000</button>
+      </div>
+      <div class="keypad" role="group" aria-label="金額の数字">
+        <button type="button" class="key" data-action="key" data-key="1">1</button>
+        <button type="button" class="key" data-action="key" data-key="2">2</button>
+        <button type="button" class="key" data-action="key" data-key="3">3</button>
+        <button type="button" class="key" data-action="key" data-key="4">4</button>
+        <button type="button" class="key" data-action="key" data-key="5">5</button>
+        <button type="button" class="key" data-action="key" data-key="6">6</button>
+        <button type="button" class="key" data-action="key" data-key="7">7</button>
+        <button type="button" class="key" data-action="key" data-key="8">8</button>
+        <button type="button" class="key" data-action="key" data-key="9">9</button>
+        <button type="button" class="key key-back" data-action="key" data-key="back" aria-label="1文字消す（長押しで全部消す）">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5h11a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H9l-6-7z"/><path d="M12.5 9.5l5 5M17.5 9.5l-5 5"/></svg>
+        </button>
+        <button type="button" class="key" data-action="key" data-key="0">0</button>
+        <button type="button" id="entryDone" class="key key-done" data-action="entry-done">完了</button>
+      </div>
+      <div class="entry-options">
+        <div class="opt-row">
+          <span class="opt-label">使った人</span>
+          <div id="entryPayer" class="seg"></div>
+        </div>
+        <div class="opt-row">
+          <span class="opt-label">誰のため</span>
+          <div id="entryFor" class="seg"></div>
+        </div>
+        <label class="memo-field">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 18.5V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H8z"/></svg>
+          <input id="entryMemo" type="text" placeholder="メモ（なくてもOK）" maxlength="60" enterkeyhint="done" autocomplete="off">
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <!-- 記録の詳細・修正シート（履歴をタップしたときだけ） -->
+  <div id="editSheet" class="sheet" role="dialog" aria-modal="true" aria-label="記録の修正" hidden>
+    <div class="sheet-backdrop" data-action="close-edit"></div>
+    <div class="sheet-panel edit-panel" tabindex="-1">
+      <div class="sheet-top">
+        <button type="button" class="icon-btn" data-action="close-edit" aria-label="閉じる">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+        </button>
+        <div id="editStatus" class="edit-status" aria-live="polite">変更はすぐ保存されます</div>
+        <button type="button" class="icon-btn icon-btn-danger" data-action="delete-edit" aria-label="この記録を削除">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9.5 7V4.5h5V7M6.5 7l.9 12.5a1 1 0 0 0 1 .9h7.2a1 1 0 0 0 1-.9L17.5 7M10 11v5.5M14 11v5.5"/></svg>
+        </button>
+      </div>
+      <div class="edit-body">
+        <div class="edit-when">
+          <input id="editDate" type="date" class="text-input" aria-label="日付">
+          <input id="editTime" type="time" class="text-input" aria-label="時刻">
+        </div>
+        <button type="button" id="editCatBtn" class="edit-cat" data-action="toggle-edit-cats" aria-expanded="false"></button>
+        <div id="editCatPicker" class="cat-picker" hidden></div>
+
+        <label class="field-label" for="editAmount">金額</label>
+        <div class="amount-field">
+          <span aria-hidden="true">¥</span>
+          <input id="editAmount" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" maxlength="9">
+        </div>
+
+        <div class="field-label">使った人</div>
+        <div id="editPayer" class="seg"></div>
+
+        <div class="field-label">誰のため</div>
+        <div id="editFor" class="seg"></div>
+
+        <label class="field-label" for="editMemo">メモ</label>
+        <input id="editMemo" type="text" class="text-input" placeholder="例：昼食（コンビニ）" maxlength="60" enterkeyhint="done" autocomplete="off">
+
+        <button type="button" class="btn btn-primary" data-action="close-edit">完了</button>
+        <button type="button" class="btn btn-soft" data-action="duplicate-edit">🔁 もう一度記録（今の時刻で）</button>
+        <button type="button" class="btn btn-text-danger" data-action="delete-edit">この記録を削除</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 初回だけ：この端末を使う人 -->
+  <div id="onboarding" class="onboarding" role="dialog" aria-modal="true" aria-labelledby="obTitle" hidden>
+    <div class="ob-inner">
+      <div class="ob-logo" data-logo></div>
+      <h1 id="obTitle" class="ob-title">なかログ</h1>
+      <p class="ob-copy">ふたりのお金を、かんたん記録。</p>
+      <h2 class="ob-question">この端末を使うのは？</h2>
+      <div id="obChoices" class="ob-choices"></div>
+      <p class="ob-note">あとから「設定」で変えられます</p>
+      <p id="obInstall" class="ob-install" hidden>
+        📲 iPhoneの方へ：Safariの共有ボタンから<b>「ホーム画面に追加」</b>してから使い始めるのがおすすめです。<br>
+        Safariとホーム画面のアプリでは、記録が別々に保存されます。
+      </p>
+    </div>
+  </div>
+
+  <input id="restoreInput" type="file" accept="application/json,.json" hidden>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <noscript>
+    <p class="noscript">なかログを使うには JavaScript を有効にしてください。</p>
+  </noscript>
+  <script src="app.js?v=0.1.0" defer></script>
+</body>
+</html>
