@@ -22,12 +22,12 @@
   /* =====================================================
    * 1. 定数・ユーティリティ
    * ===================================================== */
-  const APP_VERSION = '0.2.1';
+  const APP_VERSION = '0.2.2';
   const MAX_DIGITS = 8; // ¥99,999,999 まで
 
   // 人：payer（使った人）は self / wife、for（誰のため）は self / wife / family
   const PERSON_DEFS = {
-    self: { emoji: '👨', name: '自分' },
+    self: { emoji: '👨', name: '夫' },
     wife: { emoji: '👩', name: '妻' },
     family: { emoji: '👪', name: '家族' },
   };
@@ -1052,10 +1052,29 @@
       '</div>' +
       (selInMonth
         ? '<div class="list-head"><h2>' + fmtMD(sel) + 'の記録</h2><span class="list-total">合計 <b class="num">' + yen(sumAmount(dayTx)) + '</b></span></div>' +
-          (dayTx.length ? timelineHtml(dayTx) : '<div class="card empty">この日の記録はありません</div>') +
+          (dayTx.length ? payerSubtotalsHtml(dayTx) + timelineHtml(dayTx) : '<div class="card empty">この日の記録はありません</div>') +
           '<button type="button" class="btn btn-outline record-day-btn" data-action="record-on-day">＋ この日に記録する</button>'
         : '<div class="card empty">日付をタップすると、その日の記録が見られます</div>');
     afterListRender();
+  }
+
+  /** その日に夫・妻それぞれが使った金額（使った人ごとの小計） */
+  function payerSubtotalsHtml(list) {
+    return (
+      '<div class="payer-subtotals" aria-label="それぞれが使った金額">' +
+      PAYER_IDS.map((id) => {
+        const p = person(id);
+        const mine = list.filter((t) => t.payer === id);
+        return (
+          '<div class="payer-subtotal who-' + id + (mine.length ? '' : ' zero') + '">' +
+          '<span class="payer-subtotal-name"><span aria-hidden="true">' + p.emoji + '</span>' + escapeHtml(p.name) + '</span>' +
+          '<span class="payer-subtotal-amt num">' + yen(sumAmount(mine)) + '</span>' +
+          '<span class="payer-subtotal-count">' + mine.length + '件</span>' +
+          '</div>'
+        );
+      }).join('') +
+      '</div>'
+    );
   }
 
   function setCalMonth(month) {

@@ -353,6 +353,19 @@ h1, h2, h3, p { margin: 0; }
   margin: 0 4px 8px;
 }
 .list-head h2 { font-size: 17px; font-weight: 800; }
+
+/* カレンダー：その日の夫・妻それぞれの小計（記録の上） */
+.payer-subtotals { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+.payer-subtotal {
+  display: flex; align-items: baseline; gap: 6px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--who-soft); color: var(--who-ink);
+}
+.payer-subtotal-name { display: flex; align-items: center; gap: 4px; font-size: 15px; font-weight: 700; white-space: nowrap; }
+.payer-subtotal-amt { margin-left: auto; font-size: 18px; font-weight: 800; white-space: nowrap; }
+.payer-subtotal-count { font-size: 12px; font-weight: 600; opacity: 0.8; white-space: nowrap; }
+.payer-subtotal.zero .payer-subtotal-amt { opacity: 0.6; }
 .list-total { font-size: 14px; color: var(--text-3); }
 .list-total b { font-size: 17px; color: var(--text); }
 
