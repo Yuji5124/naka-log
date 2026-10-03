@@ -22,7 +22,7 @@
   /* =====================================================
    * 1. 定数・ユーティリティ
    * ===================================================== */
-  const APP_VERSION = '0.2.2';
+  const APP_VERSION = '0.2.3';
   const MAX_DIGITS = 8; // ¥99,999,999 まで
 
   // 人：payer（使った人）は self / wife、for（誰のため）は self / wife / family
@@ -52,6 +52,7 @@
     { id: 'utilities', emoji: '💡', name: '光熱費', tone: 'yellow', defaultFor: 'family' },
     { id: 'fixed', emoji: '🏠', name: '固定費', tone: 'green', defaultFor: 'family' },
     { id: 'tax', emoji: '🧾', name: '税金', tone: 'indigo', defaultFor: 'family' },
+    { id: 'waste', emoji: '🗑️', name: 'ゴミ！', tone: 'red', defaultFor: 'payer' }, // 要らなかったと分かっている出費
     { id: 'other', emoji: '✨', name: 'その他', tone: 'gray', defaultFor: 'family' },
   ];
   const CATEGORY_IDS = CATEGORY_DEFS.map((c) => c.id);
