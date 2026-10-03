@@ -13,7 +13,7 @@
  * （URLにバージョンが入っていて中身が変わらないため）。圏外でも同期つきで起動できる。
  */
 const CACHE_PREFIX = 'nakalog-';
-const CACHE_NAME = CACHE_PREFIX + 'v0.2.1';
+const CACHE_NAME = CACHE_PREFIX + 'v0.2.2';
 const SDK_CACHE = CACHE_PREFIX + 'sdk';
 const SDK_PREFIX = 'https://www.gstatic.com/firebasejs/';
 const NETWORK_TIMEOUT_MS = 3500; // 電波が弱いときは、これ以上待たずにキャッシュで起動
