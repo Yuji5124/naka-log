@@ -44,6 +44,7 @@
   --brown-bg:  #F3E8DE; --brown-ink:  #6B4426; --brown-bar:  #B07A4F;
   --coral-bg:  #FFE4DE; --coral-ink:  #9C3320; --coral-bar:  #F07A62;
   --lime-bg:   #EAF5D3; --lime-ink:   #4A6312; --lime-bar:   #8DBB2E;
+  --red-bg:    #FFE1E1; --red-ink:    #A61B1B; --red-bar:    #E5484D;
 
   --radius-lg: 22px;
   --radius: 16px;
@@ -84,6 +85,7 @@
     --brown-bg: #33271D; --brown-ink: #EBC9A8;
     --coral-bg: #3D211B; --coral-ink: #FFB8A8;
     --lime-bg: #26301A; --lime-ink: #CFEA9A;
+    --red-bg: #3F1A1A; --red-ink: #FFB3B3;
   }
 }
 :root[data-theme="dark"] {
@@ -110,6 +112,7 @@
   --brown-bg: #33271D; --brown-ink: #EBC9A8;
   --coral-bg: #3D211B; --coral-ink: #FFB8A8;
   --lime-bg: #26301A; --lime-ink: #CFEA9A;
+  --red-bg: #3F1A1A; --red-ink: #FFB3B3;
 }
 
 /* ---------- ベース ---------- */
@@ -255,6 +258,7 @@ h1, h2, h3, p { margin: 0; }
 .tone-brown  { --tone-bg: var(--brown-bg);  --tone-ink: var(--brown-ink);  --tone-bar: var(--brown-bar); }
 .tone-coral  { --tone-bg: var(--coral-bg);  --tone-ink: var(--coral-ink);  --tone-bar: var(--coral-bar); }
 .tone-lime   { --tone-bg: var(--lime-bg);   --tone-ink: var(--lime-ink);   --tone-bar: var(--lime-bar); }
+.tone-red    { --tone-bg: var(--red-bg);    --tone-ink: var(--red-ink);    --tone-bar: var(--red-bar); }
 
 .cat-icon {
   display: inline-flex; align-items: center; justify-content: center;
